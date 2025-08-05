@@ -27,7 +27,7 @@ class ColoredFormatter(logging.Formatter):
         return f"{color}{message}{reset}"
 
 
-def setup_logger(name: str) -> logging.Logger:
+def setup_log_sytem(name: str) -> logging.Logger:
     """
     Set up and return a logger with the given name, configured for console output.
 
