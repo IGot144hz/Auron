@@ -1,84 +1,98 @@
+# main.py
 import time
 import threading
-from utils.log_system import setup_log_sytem
+
+from utils.logging_system import setup_log_system
 from voice_recognition.voicekey_engine import VoiceKeyEngine
-from voice_recognition.stt_engine import sttEngine
+from voice_recognition.stt_engine import STTEngine
+
+logger = setup_log_system("main")
 
 
-logger = setup_log_sytem("Main")
+class AssistantApp:
+    """Owns the wakeword engine and STT engine; coordinates record → transcribe."""
 
-# Initialize the speech-to-text system (using a medium model for better accuracy; adjust as needed)
-stt = sttEngine(model_size="medium")
+    def __init__(self) -> None:
+        # Adjust model_size/device as you like (STTEngine has smart compute_type fallbacks)
+        self.stt = STTEngine(model_size="medium", device="cuda")
+        # Cooldown prevents rapid re-triggers while we process the previous one
+        self.engine = VoiceKeyEngine(self.on_wake, cooldown_seconds=1.0)
 
+        # Ensures we don't start overlapping record/transcribe cycles
+        self._busy = threading.Lock()
 
-def handle_command(audio_data):
-    """
-    Transcribe the recorded audio and log the recognized command.
-    This function can be extended to perform actions (e.g., execute the command, trigger TTS feedback, update GUI).
-    """
-    try:
-        command_text = stt.transcribe(audio_data)
-        logger.info(f"User command: {command_text}")
-        # TODO: Implement command handling (e.g., execute actions or respond via TTS/GUI).
-    except Exception as e:
-        logger.error(f"Speech transcription failed: {e}")
+    # ------------- Wakeword callback -------------
 
+    def on_wake(self) -> None:
+        """Called by VoiceKeyEngine on detection. Offload to worker thread immediately."""
+        if not self._busy.acquire(blocking=False):
+            logger.debug(
+                "Wakeword detected but a command is already being processed. Ignoring."
+            )
+            return
+        threading.Thread(target=self._process_wake_event, daemon=True).start()
 
-def process_wake_event():
-    """
-    Handle the workflow after the wake word is detected:
-      1. Pause the wakeword engine to avoid interference.
-      2. Record the user's voice command until silence.
-      3. Resume the wakeword engine to listen for the next wake word.
-      4. Transcribe the recorded command in the background.
-    """
-    # 1. Pause wakeword detection to free the microphone for recording:contentReference[oaicite:5]{index=5}
-    engine.pause()
-    logger.debug("Wakeword engine paused for voice command recording.")
-    audio_data = None
-    try:
-        # 2. Record the user's speech until silence is detected or timeout
-        audio_data = stt.record_until_silence()
-        logger.info("Voice command recording finished.")
-    except Exception as e:
-        logger.error(f"Error during voice recording: {e}")
-    finally:
-        # 3. Resume wakeword engine ASAP to start listening for the next wake word
+    # ------------- Processing pipeline -------------
+
+    def _process_wake_event(self) -> None:
+        """
+        1) Pause wakeword engine (free the mic)
+        2) Record until silence
+        3) Resume wakeword engine ASAP
+        4) Transcribe in the same worker thread (non-blocking for the audio callback)
+        """
         try:
-            engine.start()
-            logger.debug("Wakeword engine resumed.")
+            logger.info("Wake word recognized. Preparing to record command…")
+            # 1) Pause detection to free the microphone
+            self.engine.pause()
+            logger.debug("Wakeword engine paused for voice command recording.")
+
+            # 2) Record user's speech until silence or timeout
+            try:
+                audio = self.stt.record_until_silence()
+                logger.info("Voice command recording finished.")
+            except Exception as e:
+                logger.error(f"Error during voice recording: {e}", exc_info=True)
+                audio = None
+        finally:
+            # 3) Resume listening as soon as possible
+            try:
+                self.engine.start()
+                logger.debug("Wakeword engine resumed.")
+            except Exception as e:
+                logger.error(f"Failed to resume wakeword engine: {e}", exc_info=True)
+
+        # 4) Transcribe (if we captured any audio)
+        if audio is None or (hasattr(audio, "size") and audio.size == 0):
+            logger.warning("No audio captured for transcription.")
+            self._busy.release()
+            return
+
+        try:
+            text = self.stt.transcribe(audio, language="de")
+            logger.info(f"User command: {text}")
+            # TODO: Route the command (execute actions, TTS feedback, GUI update, etc.)
         except Exception as e:
-            logger.error(f"Failed to resume wakeword engine: {e}")
-    # 4. If we have recorded audio, transcribe it in a separate thread to avoid blocking
-    if audio_data is not None:
-        threading.Thread(target=handle_command, args=(audio_data,), daemon=True).start()
+            logger.error(f"Speech transcription failed: {e}", exc_info=True)
+        finally:
+            self._busy.release()
+
+    # ------------- App lifecycle -------------
+
+    def run(self) -> None:
+        """Start wakeword listening and keep the process alive."""
+        self.engine.start()
+        logger.info("System is now listening for the wake word…")
+        try:
+            while True:
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            logger.debug("Shutting down (KeyboardInterrupt received)…")
+        finally:
+            self.engine.stop()
+            logger.info("Application terminated.")
 
 
-def on_wake():
-    """Callback function invoked by WakewordEngine when the wake word is detected."""
-    logger.info("Wake word recognized. Preparing to record command...")
-    # Offload processing to a new thread so this callback returns immediately:contentReference[oaicite:6]{index=6}
-    threading.Thread(target=process_wake_event, daemon=True).start()
-
-
-# Instantiate the wakeword engine with the on_wake callback
-try:
-    engine = VoiceKeyEngine(on_wake)
-except Exception as e:
-    logger.critical(f"Failed to initialize WakewordEngine: {e}")
-    raise
-
-# Start the wakeword listening loop
-engine.start()
-logger.info("System is now listening for the wake word...")
-
-# Main loop to keep the program running; can also handle other tasks or heartbeats if needed
-try:
-    while True:
-        time.sleep(0.1)  # sleep to reduce CPU usage in the idle loop
-except KeyboardInterrupt:
-    logger.debug("Shutting down (KeyboardInterrupt received)...")
-finally:
-    # Ensure resources are cleaned up on exit
-    engine.stop()
-    logger.info("Application terminated.")
+if __name__ == "__main__":
+    app = AssistantApp()
+    app.run()

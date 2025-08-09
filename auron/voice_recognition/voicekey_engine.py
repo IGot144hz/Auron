@@ -1,178 +1,183 @@
+# voicekey_engine.py
 import os
+import threading
+import time
+from collections.abc import Callable, Sequence
+
 import numpy as np
 import pvporcupine
 import sounddevice as sd
 from dotenv import load_dotenv
-from utils.log_system import setup_log_sytem
-import threading  # for handling callback in separate thread
 
-# Load environment variables from .env (if present) before setting up the logger
+from utils.logging_system import setup_log_system
+
+# Load env before logger (so LOG_LEVEL etc. are available)
 load_dotenv()
+logger = setup_log_system("voicekey_engine")
 
-# Initialize logger for this module
-logger = setup_log_sytem("VoiceKeyEngine")
+
+def _resolve_device(device: int | str | None) -> int | None:
+    """Resolve a sounddevice input by index or fuzzy name (case-insensitive). Returns index or None."""
+    if device is None or isinstance(device, int):
+        return device
+    name_lc = device.lower()
+    for idx, info in enumerate(sd.query_devices()):
+        if (
+            info.get("max_input_channels", 0) > 0
+            and name_lc in str(info.get("name", "")).lower()
+        ):
+            return idx
+    logger.warning(f"Input device '{device}' not found, using default.")
+    return None
 
 
 class VoiceKeyEngine:
     """
-    Always-listening wake word detection engine using Picovoice Porcupine.
+    Always-listening wake word detector using Picovoice Porcupine.
 
-    Continuously listens on an audio input stream for a configured wake word and
-    triggers a callback when the wake word is detected.
-
-    **Environment Variables:**
-      - `ACCESS_KEY`: Picovoice AccessKey for Porcupine (required).
-      - `WAKEWORD_PATH`: Filesystem path to the Porcupine wake word model (.ppn file) (required).
-      - `PORC_MODEL`: Path to the Porcupine base model file (.pv file, language model) (required).
-      - `INPUT_LATENCY` (optional): Desired input latency in milliseconds (to avoid dropouts).
-      - `LOG_LEVEL` (optional): Logging verbosity (DEBUG, INFO, etc.).
-      - `NO_COLOR` (optional): If set, disable colored logging output.
-
-    **Parameters:**
-      - callback (callable): Function to call when the wake word is detected. The function
-          should not perform long-running tasks or blocking calls (it will be executed on a separate thread).
-      - sensitivity (float): Detection sensitivity (0.0 to 1.0, higher values = more sensitive). Default 0.6.
-      - device (int or str, optional): Audio input device (index or name). If not provided, uses the default input.
-
-    **Raises:**
-      - ValueError: If required environment variables are missing.
-      - pvporcupine.PorcupineError: If Porcupine initialization fails (e.g., invalid AccessKey or model paths).
+    - Triggers `callback` on detection (executed on a daemon thread).
+    - Includes a simple cooldown to avoid multi-trigger storms while the callback runs.
     """
 
-    def __init__(self, callback, sensitivity: float = 0.6, device=None):
-        # Ensure required environment variables are set
-        access_key = os.getenv("ACCESS_KEY")
-        wakeword_path = os.getenv("WAKEWORD_PATH")
-        model_path = os.getenv("PORC_MODEL")
+    def __init__(
+        self,
+        callback: Callable[[], None],
+        *,
+        keyword_paths: Sequence[str] | None = None,  # if None, reads WAKEWORD_PATH
+        sensitivities: Sequence[float] | None = None,  # per keyword, else uniform
+        model_path: str | None = None,  # if None, reads PORC_MODEL
+        access_key: str | None = None,  # if None, reads ACCESS_KEY
+        device: int | str | None = None,
+        cooldown_seconds: float = 1.0,
+        input_latency_ms: int | None = None,  # overrides env INPUT_LATENCY
+    ) -> None:
+        access_key = access_key or os.getenv("ACCESS_KEY")
+        model_path = model_path or os.getenv("PORC_MODEL")
+        kp = list(keyword_paths) if keyword_paths else [os.getenv("WAKEWORD_PATH", "")]
         if not access_key:
-            logger.critical(
-                "ACCESS_KEY is missing. Set it in environment or .env file."
-            )
-            raise ValueError("Missing Picovoice AccessKey (ACCESS_KEY).")
-        if not wakeword_path:
-            logger.critical(
-                "WAKEWORD_PATH is missing. Set it in environment or .env file."
-            )
-            raise ValueError("Missing Porcupine wakeword model path (WAKEWORD_PATH).")
+            logger.critical("Missing Picovoice AccessKey (ACCESS_KEY).")
+            raise ValueError("Missing ACCESS_KEY")
+        if not all(kp) or not kp[0]:
+            logger.critical("Missing Porcupine keyword path(s) (WAKEWORD_PATH).")
+            raise ValueError("Missing WAKEWORD_PATH")
         if not model_path:
-            logger.critical(
-                "PORC_MODEL is missing. Set it in environment or .env file."
-            )
-            raise ValueError("Missing Porcupine base model path (PORC_MODEL).")
+            logger.critical("Missing Porcupine base model path (PORC_MODEL).")
+            raise ValueError("Missing PORC_MODEL")
 
-        # Initialize Porcupine wake word detector
+        sens = (
+            list(sensitivities)
+            if sensitivities is not None
+            else [float(os.getenv("PORC_SENSITIVITY", "0.6"))] * len(kp)
+        )
+
         try:
             self.porcupine = pvporcupine.create(
                 access_key=access_key,
-                keyword_paths=[wakeword_path],
+                keyword_paths=kp,
                 model_path=model_path,
-                sensitivities=[sensitivity],
+                sensitivities=sens,
             )
-            logger.debug("Porcupine wakeword engine initialized.")
+            logger.debug("Porcupine initialized.")
         except pvporcupine.PorcupineError as e:
-            logger.error("Failed to initialize Porcupine engine: %s", e)
+            logger.error(f"Failed to initialize Porcupine: {e}")
             raise
 
-        self.callback = callback  # function to call when wake word is detected
-        # Optional: allow custom input latency via env to avoid audio dropouts
-        latency_ms = os.getenv("INPUT_LATENCY")
-        latency = float(latency_ms) / 1000.0 if latency_ms else None
+        self._callback = callback
+        self._cooldown = max(0.0, cooldown_seconds)
+        self._last_trigger: float = 0.0
 
-        # Set up the input audio stream for microphone in always-listening mode
+        latency_ms = (
+            input_latency_ms
+            if input_latency_ms is not None
+            else int(os.getenv("INPUT_LATENCY", "0") or 0)
+        )
+        latency = (latency_ms / 1000.0) if latency_ms and latency_ms > 0 else None
+
+        sd_device = _resolve_device(device)
         try:
             self.stream = sd.RawInputStream(
                 samplerate=self.porcupine.sample_rate,
                 blocksize=self.porcupine.frame_length,
                 dtype="int16",
                 channels=1,
-                callback=self._audio_callback,
-                device=device,
+                callback=self._on_audio,
+                device=sd_device,
                 latency=latency,
             )
             logger.debug(
-                "Audio input stream initialized (device=%s, samplerate=%d Hz, blocksize=%d frames).",
-                str(device),
+                "Audio input ready (device=%s, %d Hz, frame=%d).",
+                str(sd_device),
                 self.porcupine.sample_rate,
                 self.porcupine.frame_length,
             )
         except Exception as e:
-            logger.error("Failed to open audio input stream: %s", e)
-            # Clean up Porcupine if the stream failed to open
             self.porcupine.delete()
-            self.porcupine = None
+            logger.error(f"Failed to open audio input stream: {e}")
             raise
 
-    def _audio_callback(self, indata, frames, time_info, status):
-        """
-        Internal callback for the audio input stream. Processes incoming audio frames and detects the wake word.
-        This runs on a separate audio thread and should not perform blocking operations.
-        """
-        try:
-            # Handle any audio status flags (overflows, underflows)
-            if status:
-                if status.input_overflow:
-                    logger.warning(
-                        "Audio input overflow detected - missed some audio frames."
-                    )
-                if status.input_underflow:
-                    logger.warning(
-                        "Audio input underflow detected - no audio data available."
-                    )
-                # Log any other status flags if present
-                if not (status.input_overflow or status.input_underflow):
-                    logger.warning("Audio input status flag: %s", status)
+    # -------------- lifecycle --------------
+    def __enter__(self):
+        self.start()
+        return self
 
-            # Convert raw audio bytes to NumPy int16 array for processing
-            pcm = np.frombuffer(indata, dtype=np.int16)
-            result = self.porcupine.process(pcm)
-            if result >= 0:
-                # Wake word was detected. Invoke the callback in a new thread to avoid blocking this callback:contentReference[oaicite:2]{index=2}.
-                def _run_callback():
-                    try:
-                        self.callback()
-                    except Exception as e:
-                        logger.error(
-                            "Exception in wakeword callback: %s", e, exc_info=True
-                        )
+    def __exit__(self, exc_type, exc, tb):
+        self.stop()
 
-                threading.Thread(target=_run_callback, daemon=True).start()
-        except Exception as e:
-            # Log any exception to prevent the stream from stopping.
-            logger.error("Error in wakeword audio callback: %s", e, exc_info=True)
+    def start(self) -> None:
+        if self.stream and not self.stream.active:
+            self.stream.start()
+            logger.debug("VoiceKeyEngine started (listening).")
 
-    def start(self):
-        """Start listening for the wake word (opens or resumes the audio stream)."""
-        if self.stream:
-            if not self.stream.active:
-                self.stream.start()
-                logger.debug("WakewordEngine started and listening for the wake word.")
-            else:
-                logger.debug(
-                    "WakewordEngine start called, but the stream is already active."
-                )
-
-    def pause(self):
-        """Pause listening for the wake word (temporarily stops the audio stream)."""
+    def pause(self) -> None:
         if self.stream and self.stream.active:
             self.stream.stop()
-            logger.debug("WakewordEngine paused (audio stream stopped).")
-        else:
-            logger.debug("WakewordEngine pause called, but the stream was not active.")
+            logger.debug("VoiceKeyEngine paused.")
 
-    def stop(self):
-        """Completely stop the engine and release audio and detection resources."""
+    def stop(self) -> None:
         try:
             if self.stream:
                 if self.stream.active:
                     self.stream.stop()
                 self.stream.close()
-                self.stream = None
-        except Exception as e:
-            logger.warning(
-                "Exception while stopping audio stream: %s", e, exc_info=True
-            )
         finally:
-            if hasattr(self, "porcupine") and self.porcupine is not None:
+            try:
                 self.porcupine.delete()
+            finally:
+                self.stream = None
                 self.porcupine = None
-        logger.debug("WakewordEngine stopped and resources released.")
+                logger.debug("VoiceKeyEngine stopped and resources released.")
+
+    @property
+    def is_listening(self) -> bool:
+        return bool(self.stream and self.stream.active)
+
+    # -------------- audio callback --------------
+    def _on_audio(self, indata, frames, time_info, status):
+        try:
+            if status:
+                if status.input_overflow:
+                    logger.warning("Audio input overflow detected.")
+                if status.input_underflow:
+                    logger.warning("Audio input underflow detected.")
+                if not (status.input_overflow or status.input_underflow):
+                    logger.warning(f"Audio input status flag: {status}")
+
+            pcm = np.frombuffer(indata, dtype=np.int16)
+            result = self.porcupine.process(pcm)
+            if result >= 0:
+                now = time.time()
+                if now - self._last_trigger < self._cooldown:
+                    return  # debounce
+                self._last_trigger = now
+
+                def _run():
+                    try:
+                        self._callback()
+                    except Exception as e:
+                        logger.error(
+                            f"Exception in wakeword callback: {e}", exc_info=True
+                        )
+
+                threading.Thread(target=_run, daemon=True).start()
+        except Exception as e:
+            logger.error(f"Error in wakeword audio callback: {e}", exc_info=True)

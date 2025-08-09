@@ -1,71 +1,106 @@
+# stt_engine.py
+# ruff: noqa: E402
 import warnings
-import sounddevice as sd
-import numpy as np
-import queue
-import time
-import tempfile
-import os
-from faster_whisper import WhisperModel
-import scipy.io.wavfile
-from utils.log_system import setup_log_sytem
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-import webrtcvad  # noqa: E402
+import time
+from dataclasses import dataclass
+from collections.abc import Iterable
 
-logger = setup_log_sytem("SpeechToText")
+import numpy as np
+import sounddevice as sd
+import webrtcvad
+from faster_whisper import WhisperModel
 
-# Configuration constants
-SAMPLE_RATE = 16000  # Audio sample rate in Hz
-CHANNELS = 1  # Mono audio
-FRAME_DURATION_MS = 30  # Frame size for VAD in milliseconds (10, 20, or 30 ms frames)
-VAD_AGGRESSIVENESS = 2  # VAD mode (0 = very sensitive, 3 = very strict)
-MAX_RECORD_SECONDS = 10  # Safety limit for maximum recording duration
+from utils.logging_system import setup_log_system
+
+logger = setup_log_system("stt_engine")
 
 
-class sttEngine:
+@dataclass
+class STTConfig:
+    sample_rate: int = 16_000
+    channels: int = 1
+    frame_ms: int = 30  # VAD supports 10, 20, or 30 ms
+    vad_aggressiveness: int = 2  # 0..3
+    max_record_seconds: int = 20
+    min_silence_time: float = 1.2  # seconds of continuous silence to stop
+    pre_speech_padding_ms: int = 300  # keep a bit before first detected speech
+
+
+class STTEngine:
     """
-    Speech-to-Text engine that records microphone audio until silence is detected, then transcribes it using Whisper.
+    Records microphone audio until a period of silence and transcribes with faster-whisper.
 
-    Uses WebRTC VAD (Voice Activity Detection) to determine when the user stops speaking.
-
-    **Parameters:**
-      - model_size (str): Which Whisper model to load (e.g., 'small', 'medium'). Defaults to 'small'.
-      - device (str): Device for running the model ('cpu', 'cuda', or 'auto'). Defaults to 'auto'.
-
-    **Raises:**
-      - Exception: If loading the Whisper model fails.
+    - Uses WebRTC VAD to determine end-of-speech.
+    - Feeds float32 numpy audio directly to faster-whisper (no temp WAV files).
     """
 
-    def __init__(self, model_size="small", device="auto"):
-        try:
-            # Load Whisper model (with int8 quantization for efficiency on CPU, if used)
-            self.model = WhisperModel(model_size, device=device, compute_type="int8")
-            logger.debug(f"Whisper model '{model_size}' loaded (device: {device}).")
-        except Exception as e:
-            logger.error(f"Failed to load Whisper model: {e}", exc_info=True)
-            raise
+    def __init__(
+        self,
+        model_size: str = "small",
+        device: str = "auto",  # 'auto' | 'cpu' | 'cuda'
+        compute_type: str | None = None,  # None => smart fallback
+        cfg: STTConfig | None = None,
+    ) -> None:
+        self.cfg = cfg or STTConfig()
+        self._frame_samples = int(self.cfg.sample_rate * self.cfg.frame_ms / 1000)
+        self._pre_pad_frames = max(
+            1, int(self.cfg.pre_speech_padding_ms / self.cfg.frame_ms)
+        )
 
-    def record_until_silence(
-        self, max_duration=MAX_RECORD_SECONDS, min_silence_time=1.5
-    ):
+        # Smart compute_type fallback to avoid CPU float16 errors when 'auto' picks CPU
+        if compute_type is not None:
+            preferred: Iterable[str] = (compute_type,)
+        elif device == "cpu":
+            preferred = ("int8", "int16", "float32")
+        else:
+            preferred = ("float16", "int8", "int16", "float32")
+
+        last_err: Exception | None = None
+        for ct in preferred:
+            try:
+                self.model = WhisperModel(model_size, device=device, compute_type=ct)
+                logger.debug(
+                    f"Loaded Whisper model='{model_size}' (device={device}, compute_type={ct})."
+                )
+                break
+            except Exception as e:  # try next compute type
+                last_err = e
+                logger.warning(f"Failed loading compute_type={ct}, trying next… ({e})")
+        else:
+            logger.error("Could not initialize Whisper model with any compute_type.")
+            if last_err:
+                raise last_err
+            raise RuntimeError(
+                "Whisper model initialization failed with unknown error."
+            )
+
+    # ------------------- Recording -------------------
+    def _vad_is_speech(self, frame_int16: np.ndarray, vad: webrtcvad.Vad) -> bool:
+        """Return True if the frame contains speech. Expects 1-D int16 mono samples of length _frame_samples."""
+        assert frame_int16.ndim == 1 and frame_int16.dtype == np.int16
+        return vad.is_speech(frame_int16.tobytes(), self.cfg.sample_rate)
+
+    def record_until_silence(self) -> np.ndarray:
         """
-        Record audio from the microphone until a period of silence is detected or until max_duration is reached.
-
-        Returns:
-            numpy.ndarray: Recorded audio samples as a 1-D NumPy array of int16.
+        Record from the default microphone until VAD registers `min_silence_time` after any speech.
+        Returns a 1-D int16 numpy array (mono, `cfg.sample_rate`).
         """
-        vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
-        frame_size = int(
-            SAMPLE_RATE * FRAME_DURATION_MS / 1000
-        )  # number of samples per VAD frame
-        audio_queue = queue.Queue()
-        audio_frames = []
+        vad = webrtcvad.Vad(self.cfg.vad_aggressiveness)
+        frame_len = self._frame_samples
 
-        # Callback to capture audio into the queue
-        def audio_callback(indata, frames, time_info, status):
+        # Ring buffer to keep some audio before first speech (for non-clipped start)
+        pad_buffer: list[np.ndarray] = []
+        audio_frames: list[np.ndarray] = []
+        have_detected_speech = False
+        silence_started_at: float | None = None
+        start_time = time.time()
+
+        def on_audio(indata, frames, time_info, status):
+            nonlocal have_detected_speech, silence_started_at
             if status:
-                # Log buffer over/underflow conditions if any
                 if status.input_overflow:
                     logger.warning(
                         "Recording input overflow: some audio frames were lost."
@@ -76,89 +111,93 @@ class sttEngine:
                     )
                 if not (status.input_overflow or status.input_underflow):
                     logger.warning(f"Recording input status flag: {status}")
-            # Append the audio chunk to the queue for processing
-            audio_queue.put(indata.copy())
 
-        # Open an input stream for recording
+            # indata shape: (frames, channels) with dtype=int16
+            mono = indata[:, 0].copy()  # channels=1 in our stream config
+
+            # Keep a small pre-speech buffer
+            if not have_detected_speech:
+                pad_buffer.append(mono)
+                if len(pad_buffer) > self._pre_pad_frames:
+                    pad_buffer.pop(0)
+
+            is_speech = self._vad_is_speech(mono, vad)
+            if is_speech:
+                if not have_detected_speech:
+                    # flush pre-speech padding into main buffer
+                    audio_frames.extend(pad_buffer)
+                    pad_buffer.clear()
+                have_detected_speech = True
+                silence_started_at = None
+                audio_frames.append(mono)
+            else:
+                if have_detected_speech:
+                    audio_frames.append(mono)
+                    if silence_started_at is None:
+                        silence_started_at = time.time()
+
         with sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
+            samplerate=self.cfg.sample_rate,
+            channels=self.cfg.channels,
             dtype="int16",
-            blocksize=frame_size,
-            callback=audio_callback,
+            blocksize=frame_len,
+            callback=on_audio,
         ):
-            logger.info("Voice recording started (waiting for silence or timeout)...")
-            start_time = time.time()
-            silence_start_time = None
-
+            logger.info("Voice recording started (waiting for silence or timeout)…")
             while True:
-                # If recording time exceeds maximum, stop recording
-                if time.time() - start_time > max_duration:
-                    logger.info(
-                        "Maximum recording duration reached, stopping recording."
-                    )
+                now = time.time()
+                if now - start_time > self.cfg.max_record_seconds:
+                    logger.info("Maximum recording duration reached, stopping.")
                     break
-                try:
-                    data = audio_queue.get(timeout=0.5)
-                except queue.Empty:
-                    # No data available yet, continue waiting
-                    continue
-
-                audio_frames.append(data)
-                # Check if the current audio frame contains speech
-                is_speech = vad.is_speech(data.tobytes(), SAMPLE_RATE)
-                if is_speech:
-                    silence_start_time = None  # reset silence timer on speech
-                else:
-                    if silence_start_time is None:
-                        # Start counting silence duration
-                        silence_start_time = time.time()
-                    elif time.time() - silence_start_time >= min_silence_time:
-                        # Sufficient silence detected, stop recording
+                if have_detected_speech and silence_started_at is not None:
+                    if now - silence_started_at >= self.cfg.min_silence_time:
                         logger.debug("Silence detected, stopping recording.")
                         break
+                time.sleep(0.02)
 
-            logger.debug("Voice recording ended.")
+        if not audio_frames:
+            logger.debug("No audio captured.")
+            return np.array([], dtype=np.int16)
 
-        # Combine all recorded frames into a single numpy array
-        if audio_frames:
-            recorded_audio = np.concatenate(audio_frames, axis=0).flatten()
-        else:
-            recorded_audio = np.array([], dtype=np.int16)
-        return recorded_audio
+        audio = np.concatenate(audio_frames, axis=0).astype(np.int16)
+        logger.debug(
+            f"Captured {len(audio)} samples (~{len(audio)/self.cfg.sample_rate:.2f}s)."
+        )
+        return audio
 
-    def transcribe(self, audio_data: np.ndarray):
+    # ------------------- Transcription -------------------
+    def transcribe(
+        self,
+        audio_int16: np.ndarray,
+        *,
+        language: str | None = "de",
+        beam_size: int = 5,
+    ) -> str:
         """
-        Transcribe the given audio data to text using the Whisper model.
-
-        Parameters:
-            audio_data (np.ndarray): 1-D array of int16 audio samples (16 kHz).
-
-        Returns:
-            str: The transcribed text.
+        Transcribe an int16 mono signal. Returns the concatenated text.
         """
-        logger.debug("Starting transcription...")
+        if audio_int16.size == 0:
+            return ""
+
+        audio_f32 = (audio_int16.astype(np.float32) / 32768.0).clip(-1.0, 1.0)
         try:
-            # Write the audio data to a temporary WAV file (16 kHz, mono)
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
-                scipy.io.wavfile.write(tmp_wav.name, SAMPLE_RATE, audio_data)
-                wav_path = tmp_wav.name
-            # Use the Whisper model to transcribe the audio file (assuming German language for accuracy)
-            segments, info = self.model.transcribe(wav_path, beam_size=5, language="de")
-            # Concatenate text from all segments
-            result_text = " ".join(segment.text.strip() for segment in segments).strip()
-            logger.debug(f"Transcription result: '{result_text}'")
-            # Remove the temporary file after transcription
-            os.remove(wav_path)
-            logger.debug("Transcription completed.")
-            return result_text
+            segments, info = self.model.transcribe(
+                audio_f32,
+                beam_size=beam_size,
+                language=language,
+                # You can enable the following if you want extra robustness (slower):
+                # vad_filter=True,
+                # vad_parameters={"min_silence_duration_ms": int(self.cfg.min_silence_time * 1000)},
+            )
+            text = " ".join(seg.text.strip() for seg in segments).strip()
+            logger.debug(f"Transcription result: '{text}'")
+            return text
         except Exception as e:
             logger.error(f"Error during transcription: {e}", exc_info=True)
             raise
 
-    def record_and_transcribe(self):
-        """
-        Convenience method to record from microphone until silence and then return the transcribed text.
-        """
+    def record_and_transcribe(
+        self, *, language: str | None = "de", beam_size: int = 5
+    ) -> str:
         audio = self.record_until_silence()
-        return self.transcribe(audio)
+        return self.transcribe(audio, language=language, beam_size=beam_size)
