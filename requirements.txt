@@ -1,0 +1,14 @@
+# Core dependencies
+pvporcupine
+sounddevice
+faster-whisper
+webrtcvad
+numpy
+python-dotenv
+requests
+chatterbox
+torch
+torchaudio
+discord.py
+rich
+flask

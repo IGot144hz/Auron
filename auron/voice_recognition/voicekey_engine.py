@@ -1,4 +1,12 @@
-# voicekey_engine.py
+"""
+Wake‑word detection engine using Picovoice Porcupine.
+
+This module wraps the Picovoice Porcupine library to provide always‑on wake
+word detection.  When the configured keyword is detected, a user‑supplied
+callback is invoked on a daemon thread.  A simple cooldown prevents rapid
+re‑triggering while the callback is still executing.
+"""
+
 import os
 import threading
 import time
@@ -7,9 +15,14 @@ from collections.abc import Callable, Sequence
 import numpy as np
 import pvporcupine
 import sounddevice as sd
-from dotenv import load_dotenv
+try:
+    # Use python‑dotenv to load environment variables if available
+    from dotenv import load_dotenv  # type: ignore[assignment]
+except Exception:
+    def load_dotenv(*args, **kwargs) -> None:  # type: ignore[override]
+        return
 
-from utils.logging_system import setup_log_system
+from ..utils.logging_system import setup_log_system
 
 # Load env before logger (so LOG_LEVEL etc. are available)
 load_dotenv()
@@ -17,7 +30,10 @@ logger = setup_log_system("voicekey_engine")
 
 
 def _resolve_device(device: int | str | None) -> int | None:
-    """Resolve a sounddevice input by index or fuzzy name (case-insensitive). Returns index or None."""
+    """Resolve a sounddevice input by index or fuzzy name (case‑insensitive).
+
+    Returns the device index if found or ``None`` to use the default device.
+    """
     if device is None or isinstance(device, int):
         return device
     name_lc = device.lower()
@@ -33,10 +49,11 @@ def _resolve_device(device: int | str | None) -> int | None:
 
 class VoiceKeyEngine:
     """
-    Always-listening wake word detector using Picovoice Porcupine.
+    Always‑listening wake word detector using Picovoice Porcupine.
 
-    - Triggers `callback` on detection (executed on a daemon thread).
-    - Includes a simple cooldown to avoid multi-trigger storms while the callback runs.
+    - Triggers ``callback`` on detection (executed on a daemon thread).
+    - Includes a simple cooldown to avoid multi‑trigger storms while the
+      callback runs.
     """
 
     def __init__(
@@ -116,11 +133,11 @@ class VoiceKeyEngine:
             raise
 
     # -------------- lifecycle --------------
-    def __enter__(self):
+    def __enter__(self) -> "VoiceKeyEngine":
         self.start()
         return self
 
-    def __exit__(self, exc_type, exc, tb):
+    def __exit__(self, exc_type, exc, tb) -> None:
         self.stop()
 
     def start(self) -> None:
@@ -152,7 +169,7 @@ class VoiceKeyEngine:
         return bool(self.stream and self.stream.active)
 
     # -------------- audio callback --------------
-    def _on_audio(self, indata, frames, time_info, status):
+    def _on_audio(self, indata, frames, time_info, status) -> None:
         try:
             if status:
                 if status.input_overflow:
@@ -170,7 +187,7 @@ class VoiceKeyEngine:
                     return  # debounce
                 self._last_trigger = now
 
-                def _run():
+                def _run() -> None:
                     try:
                         self._callback()
                     except Exception as e:

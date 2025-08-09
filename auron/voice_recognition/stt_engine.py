@@ -1,9 +1,13 @@
-# stt_engine.py
-# ruff: noqa: E402
+"""
+Speech‑to‑text engine using Faster Whisper and WebRTC VAD.
+
+This module records audio from the microphone until a period of silence is
+detected, then transcribes it using the Faster Whisper model.  It feeds
+float32 numpy audio directly to the model and avoids temporary files.
+"""
+from __future__ import annotations
+
 import warnings
-
-warnings.filterwarnings("ignore", category=UserWarning)
-
 import time
 from dataclasses import dataclass
 from collections.abc import Iterable
@@ -13,7 +17,7 @@ import sounddevice as sd
 import webrtcvad
 from faster_whisper import WhisperModel
 
-from utils.logging_system import setup_log_system
+from ..utils.logging_system import setup_log_system
 
 logger = setup_log_system("stt_engine")
 
@@ -31,10 +35,11 @@ class STTConfig:
 
 class STTEngine:
     """
-    Records microphone audio until a period of silence and transcribes with faster-whisper.
+    Records microphone audio until a period of silence and transcribes with
+    Faster Whisper.
 
-    - Uses WebRTC VAD to determine end-of-speech.
-    - Feeds float32 numpy audio directly to faster-whisper (no temp WAV files).
+    - Uses WebRTC VAD to determine end‑of‑speech.
+    - Feeds float32 numpy audio directly to Faster Whisper (no temp WAV files).
     """
 
     def __init__(
@@ -44,11 +49,11 @@ class STTEngine:
         compute_type: str | None = None,  # None => smart fallback
         cfg: STTConfig | None = None,
     ) -> None:
+        # Suppress noisy warnings from dependencies
+        warnings.filterwarnings("ignore", category=UserWarning)
         self.cfg = cfg or STTConfig()
         self._frame_samples = int(self.cfg.sample_rate * self.cfg.frame_ms / 1000)
-        self._pre_pad_frames = max(
-            1, int(self.cfg.pre_speech_padding_ms / self.cfg.frame_ms)
-        )
+        self._pre_pad_frames = max(1, int(self.cfg.pre_speech_padding_ms / self.cfg.frame_ms))
 
         # Smart compute_type fallback to avoid CPU float16 errors when 'auto' picks CPU
         if compute_type is not None:
@@ -73,49 +78,44 @@ class STTEngine:
             logger.error("Could not initialize Whisper model with any compute_type.")
             if last_err:
                 raise last_err
-            raise RuntimeError(
-                "Whisper model initialization failed with unknown error."
-            )
+            raise RuntimeError("Whisper model initialization failed with unknown error.")
 
     # ------------------- Recording -------------------
     def _vad_is_speech(self, frame_int16: np.ndarray, vad: webrtcvad.Vad) -> bool:
-        """Return True if the frame contains speech. Expects 1-D int16 mono samples of length _frame_samples."""
+        """Return True if the frame contains speech. Expects 1‑D int16 mono samples of length ``_frame_samples``."""
         assert frame_int16.ndim == 1 and frame_int16.dtype == np.int16
         return vad.is_speech(frame_int16.tobytes(), self.cfg.sample_rate)
 
     def record_until_silence(self) -> np.ndarray:
         """
-        Record from the default microphone until VAD registers `min_silence_time` after any speech.
-        Returns a 1-D int16 numpy array (mono, `cfg.sample_rate`).
+        Record from the default microphone until VAD registers ``min_silence_time`` after any speech.
+
+        Returns a 1‑D int16 numpy array (mono, ``cfg.sample_rate``).
         """
         vad = webrtcvad.Vad(self.cfg.vad_aggressiveness)
         frame_len = self._frame_samples
 
-        # Ring buffer to keep some audio before first speech (for non-clipped start)
+        # Ring buffer to keep some audio before first speech (for non‑clipped start)
         pad_buffer: list[np.ndarray] = []
         audio_frames: list[np.ndarray] = []
         have_detected_speech = False
         silence_started_at: float | None = None
         start_time = time.time()
 
-        def on_audio(indata, frames, time_info, status):
+        def on_audio(indata, frames, time_info, status) -> None:
             nonlocal have_detected_speech, silence_started_at
             if status:
                 if status.input_overflow:
-                    logger.warning(
-                        "Recording input overflow: some audio frames were lost."
-                    )
+                    logger.warning("Recording input overflow: some audio frames were lost.")
                 if status.input_underflow:
-                    logger.warning(
-                        "Recording input underflow: no audio data available."
-                    )
+                    logger.warning("Recording input underflow: no audio data available.")
                 if not (status.input_overflow or status.input_underflow):
                     logger.warning(f"Recording input status flag: {status}")
 
             # indata shape: (frames, channels) with dtype=int16
             mono = indata[:, 0].copy()  # channels=1 in our stream config
 
-            # Keep a small pre-speech buffer
+            # Keep a small pre‑speech buffer
             if not have_detected_speech:
                 pad_buffer.append(mono)
                 if len(pad_buffer) > self._pre_pad_frames:
@@ -124,7 +124,7 @@ class STTEngine:
             is_speech = self._vad_is_speech(mono, vad)
             if is_speech:
                 if not have_detected_speech:
-                    # flush pre-speech padding into main buffer
+                    # flush pre‑speech padding into main buffer
                     audio_frames.extend(pad_buffer)
                     pad_buffer.clear()
                 have_detected_speech = True
@@ -174,7 +174,7 @@ class STTEngine:
         beam_size: int = 5,
     ) -> str:
         """
-        Transcribe an int16 mono signal. Returns the concatenated text.
+        Transcribe an int16 mono signal.  Returns the concatenated text.
         """
         if audio_int16.size == 0:
             return ""
@@ -199,5 +199,6 @@ class STTEngine:
     def record_and_transcribe(
         self, *, language: str | None = "de", beam_size: int = 5
     ) -> str:
+        """Helper to record and transcribe in one call."""
         audio = self.record_until_silence()
         return self.transcribe(audio, language=language, beam_size=beam_size)

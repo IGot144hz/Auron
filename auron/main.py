@@ -1,98 +1,61 @@
-# main.py
+"""
+Entry point for the Auron assistant.
+
+Depending on command‑line flags, this module launches the assistant either
+with a graphical user interface or as a headless process that listens for
+voice commands.  The assistant controller coordinates voice recognition,
+command routing, LLM integration, TTS output and Discord connectivity.
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
 import time
-import threading
 
-from utils.logging_system import setup_log_system
-from voice_recognition.voicekey_engine import VoiceKeyEngine
-from voice_recognition.stt_engine import STTEngine
+from .assistant_controller import AssistantController
 
-logger = setup_log_system("main")
+# GUIApp (Tkinter) is no longer used in this version.  The assistant now
+# defaults to a web‑based interface served by Flask.
+GUIApp = None  # type: ignore
 
 
-class AssistantApp:
-    """Owns the wakeword engine and STT engine; coordinates record → transcribe."""
+logger = logging.getLogger(__name__)
 
-    def __init__(self) -> None:
-        # Adjust model_size/device as you like (STTEngine has smart compute_type fallbacks)
-        self.stt = STTEngine(model_size="medium", device="cuda")
-        # Cooldown prevents rapid re-triggers while we process the previous one
-        self.engine = VoiceKeyEngine(self.on_wake, cooldown_seconds=1.0)
 
-        # Ensures we don't start overlapping record/transcribe cycles
-        self._busy = threading.Lock()
+def main(argv: list[str] | None = None) -> None:
+    """Launch the Auron assistant with either the web interface or headless mode."""
+    parser = argparse.ArgumentParser(description="Run the Auron assistant")
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="run without any user interface (CLI only)",
+    )
+    args = parser.parse_args(argv)
 
-    # ------------- Wakeword callback -------------
-
-    def on_wake(self) -> None:
-        """Called by VoiceKeyEngine on detection. Offload to worker thread immediately."""
-        if not self._busy.acquire(blocking=False):
-            logger.debug(
-                "Wakeword detected but a command is already being processed. Ignoring."
-            )
-            return
-        threading.Thread(target=self._process_wake_event, daemon=True).start()
-
-    # ------------- Processing pipeline -------------
-
-    def _process_wake_event(self) -> None:
-        """
-        1) Pause wakeword engine (free the mic)
-        2) Record until silence
-        3) Resume wakeword engine ASAP
-        4) Transcribe in the same worker thread (non-blocking for the audio callback)
-        """
-        try:
-            logger.info("Wake word recognized. Preparing to record command…")
-            # 1) Pause detection to free the microphone
-            self.engine.pause()
-            logger.debug("Wakeword engine paused for voice command recording.")
-
-            # 2) Record user's speech until silence or timeout
-            try:
-                audio = self.stt.record_until_silence()
-                logger.info("Voice command recording finished.")
-            except Exception as e:
-                logger.error(f"Error during voice recording: {e}", exc_info=True)
-                audio = None
-        finally:
-            # 3) Resume listening as soon as possible
-            try:
-                self.engine.start()
-                logger.debug("Wakeword engine resumed.")
-            except Exception as e:
-                logger.error(f"Failed to resume wakeword engine: {e}", exc_info=True)
-
-        # 4) Transcribe (if we captured any audio)
-        if audio is None or (hasattr(audio, "size") and audio.size == 0):
-            logger.warning("No audio captured for transcription.")
-            self._busy.release()
-            return
-
-        try:
-            text = self.stt.transcribe(audio, language="de")
-            logger.info(f"User command: {text}")
-            # TODO: Route the command (execute actions, TTS feedback, GUI update, etc.)
-        except Exception as e:
-            logger.error(f"Speech transcription failed: {e}", exc_info=True)
-        finally:
-            self._busy.release()
-
-    # ------------- App lifecycle -------------
-
-    def run(self) -> None:
-        """Start wakeword listening and keep the process alive."""
-        self.engine.start()
-        logger.info("System is now listening for the wake word…")
+    if args.headless:
+        # Headless mode: just start voice recognition and wait
+        controller = AssistantController()
+        controller.start_voice_recognition()
+        logger.info("Running headless. Press Ctrl+C to exit.")
         try:
             while True:
                 time.sleep(0.1)
         except KeyboardInterrupt:
-            logger.debug("Shutting down (KeyboardInterrupt received)…")
+            logger.info("KeyboardInterrupt received, shutting down…")
         finally:
-            self.engine.stop()
-            logger.info("Application terminated.")
+            controller.stop_voice_recognition()
+            controller.stop_discord()
+            logger.info("Assistant shutdown.")
+    else:
+        # Default: start the web interface
+        from .web.flask_app import run_app  # type: ignore
+        logger.info("Starting web UI on http://127.0.0.1:5000 …")
+        try:
+            run_app()
+        finally:
+            logger.info("Web UI terminated. Shutting down subsystems…")
 
 
 if __name__ == "__main__":
-    app = AssistantApp()
-    app.run()
+    main(sys.argv[1:])
